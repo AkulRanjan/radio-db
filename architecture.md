@@ -1,6 +1,17 @@
 # radio-db — Architecture
 
-> Status: design sketch (v0). Nothing here is implemented yet.
+> Status: v1 implemented for local development (see §12). Sections 1–10 are the full target
+> design; §12 says exactly which parts exist today and how production differs.
+
+## 0. Requirements (decided)
+
+| Question | Decision |
+|---|---|
+| Content | Conversations, English only |
+| Volume | ~5 hours of audio per user |
+| Retention | 1 year from upload, then automatic deletion |
+| Environment | This repo is the **local** environment; production adds cloud object storage |
+| Speaker identification | **Required**: who spoke when, consistent identities across recordings, named voice profiles |
 
 ## 1. What "natural form" means here
 
@@ -181,11 +192,93 @@ GET    /export/lhotse?cut_id=         export manifests for training
 
 ## 11. Open questions
 
-- Primary content: broadcast radio, conversational recordings, or both? (Affects chunking and live path priority.)
-- Languages to support? (Drives ASR / embedding model choice.)
-- Expected volume (hours/day) and retention period?
-- Self-hosted only, or is cloud object storage acceptable?
-- Is speaker identification (naming people) in scope, given the legal implications?
+All of the original open questions are answered in §0. Remaining ones:
+
+- Production identity provider (the API currently trusts an `X-User-Id` header).
+- Which cloud provider for production object storage (any S3-compatible store works as-is).
+- Whether users must explicitly consent before a named voice profile is created for a third party.
+
+## 12. v1 implementation (what exists today)
+
+v1 covers build-order steps 1–3 (§10) plus speaker identification, sized for the decided
+workload (§0). Paralinguistic layers (prosody, emotion), CLAP sound search, semantic speech
+search, codec tokens and live capture are **not built yet**.
+
+### 12.1 Local vs. production
+
+| Concern | Local (this repo, default) | Production |
+|---|---|---|
+| Audio blobs | `LocalBlobStore` → `./data/blobs/` | `S3BlobStore` (`RADIODB_BLOB_BACKEND=s3`, SSE-AES256), any S3-compatible service |
+| Catalog | SQLite (WAL) + FTS5 | PostgreSQL + `tsvector` (port the `Catalog` class; schema is plain SQL) |
+| Vectors | float32 blobs in the catalog, brute-force cosine in NumPy | same, or pgvector if per-user data grows far past 5 h |
+| Jobs | synchronous (CLI) / FastAPI `BackgroundTasks` (API) | a real queue (Celery / Arq) with retries |
+| Auth | `X-User-Id` header, trusted | verified token → user id at the gateway |
+| Retention | `radiodb purge` | the same command on a daily scheduler, plus an S3 lifecycle rule as a backstop |
+
+### 12.2 Models (all non-gated, no Hugging Face token)
+
+| Layer | Model | Notes |
+|---|---|---|
+| VAD | Silero VAD | speech regions |
+| Speaker embeddings | SpeechBrain ECAPA-TDNN (`spkrec-ecapa-voxceleb`, 192-d) | diarization windows, per-segment voiceprints, enrollment |
+| ASR | faster-whisper `small.en` (configurable via `RADIODB_ASR_MODEL`) | English-only, word timestamps; fits a 6 GB GPU in float16, falls back to CPU int8 |
+
+pyannote's diarization pipeline is better at overlapping speech, but it is gated behind an HF
+token and licence acceptance. v1 builds diarization from the components above instead. Swapping
+in pyannote only means implementing the `diarize()` contract (turns + per-cluster centroids).
+
+### 12.3 Processing flow per recording
+
+```
+blob ──decode──► mono 16 kHz
+   ├─ Silero VAD ─► speech spans ─► 1.5 s windows (0.75 s hop) ─► ECAPA ─► agglomerative
+   │                                    clustering (cosine, avg linkage, thr 0.6) ─► fold clusters with
+   │                                    < 3 s of speech into nearest large cluster ─► turns + centroids
+   ├─ faster-whisper ─► words with timestamps
+   └─ words × turns ─► each word to the turn it overlaps most ─► segments
+                       (split on speaker change or >1 s pause; voiced turns with no words kept)
+segments ─► ECAPA voiceprint per segment (first 30 s)
+clusters ─► identification against the user's speakers (§12.4)
+```
+
+### 12.4 Speaker identification
+
+- **Per-user speaker registry.** A `Speaker` has a centroid (L2-normalised ECAPA embedding),
+  an optional name, and an `enrolled` flag.
+- **Matching.** Each cluster centroid in a new recording (longest talker first) is compared by
+  cosine similarity with all of the user's speakers. Score ≥ `RADIODB_SPEAKER_MATCH_THRESHOLD`
+  (default 0.60) → same person. Otherwise a new, unnamed speaker is created. So the same voice
+  gets the same id across recordings without anyone naming it.
+- **Learning.** Unnamed speakers' centroids are refined with a running mean as they reappear.
+  Enrolled profiles stay anchored to the user's own samples so they can't drift.
+- **Enrollment.** `enroll(name, clips)` builds a voiceprint from speech-only audio (VAD,
+  ≤10 s chunks averaged), then **retroactively** relabels every unnamed speaker that matches
+  it, so past recordings pick up the name.
+- **Corrections.** `rename`, `merge` (fixes one person split into two clusters) and `delete`.
+  Delete removes the profile *and* every per-segment voice embedding (biometric erasure); the
+  transcript text stays, unattributed.
+- **Query by voice.** A clip → voiceprint → ranked speakers plus the closest segments.
+
+### 12.5 Sizing at the decided workload
+
+| Item | Per user (5 h) |
+|---|---|
+| FLAC audio | ~0.3 GB at 16 kHz mono, up to ~2 GB at 48 kHz stereo |
+| Segments | roughly 1,500–3,000 |
+| Voice embeddings | ~2 MB (768 B each) |
+| Processing time | not yet measured at 5 h scale (see §12.7) |
+
+At this scale exact brute-force cosine search over a user's segments takes milliseconds, so an
+ANN index would add complexity for no gain. Revisit if a single user's data gets past ~100 h.
+
+### 12.6 Storage rules as implemented
+
+- WAV/AIFF/FLAC input → re-encoded to FLAC at the source bit depth (bit-exact; tested).
+- MP3/Vorbis/Opus input → original bytes kept untouched (no lossy→lossless bloat, no generation loss).
+- Blob key = SHA-256 of the stored bytes. Re-uploads are deduplicated per user. A blob shared by
+  several users is deleted only when its last recording goes.
+- `expires_at = created_at + 365 days` (`RADIODB_RETENTION_DAYS`). `radiodb purge` deletes rows, cascades segments, removes unshared blobs.
+- Every recording records the models that built its layers (`producers`) so it can be reprocessed when models improve.
 
 ## References
 
@@ -202,3 +295,22 @@ GET    /export/lhotse?cut_id=         export manifests for training
 - pyannote.audio — https://github.com/pyannote/pyannote-audio
 - AudioVec (VGGish + TimescaleDB) — https://github.com/jamesfreire/TimescaleDB-AudioVec
 - *Speaker Retrieval in the Wild* — https://arxiv.org/pdf/2504.18950
+
+### 12.7 Validation so far
+
+Measured on pyannote's 30 s two-speaker telephone clip (`samples/sample.wav` + reference RTTM),
+CPU only (the CUDA PyTorch wheel has not been installed yet):
+
+| Check | Result |
+|---|---|
+| Speakers found | 2 of 2. Before small-cluster folding it was 6, which is why folding exists |
+| Frame-level speaker accuracy vs. reference | 87 % (fast turn-taking with overlap; errors sit at turn boundaries) |
+| Transcript (Whisper `small.en`) | correct on manual reading |
+| Voice ID after enrolling from one segment | same speaker 0.78, other speaker 0.50 (threshold 0.60) |
+| Wall time, 30 s clip incl. model load | ~15 s on CPU |
+
+Diarization parameters were swept on this one clip (window 1.5/2/3 s × linkage × threshold
+0.5–0.9 × min-speaker 2/3/5 s). With 1.5 s windows the result was stable for thresholds 0.6–0.7 and
+min-speaker 2–5 s. **One 30 s clip is not a calibration set.** Before production, label 20–30
+minutes of real user conversations and re-check `DIARIZATION_THRESHOLD`,
+`SPEAKER_MATCH_THRESHOLD` and GPU throughput at 5 h scale.
