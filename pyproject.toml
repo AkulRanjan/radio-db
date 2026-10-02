@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "radiodb"
+version = "0.1.0"
+description = "A database for conversational voice stored in its natural form, with speaker identification."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "scipy",
+    "scikit-learn",
+    "soundfile>=0.12",
+    "fastapi",
+    "uvicorn[standard]",
+    "python-multipart",
+    "typer",
+]
+
+[project.optional-dependencies]
+# PyTorch: install the CUDA build first if you have an NVIDIA GPU, e.g.
+#   pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu126
+ml = ["torch", "torchaudio", "speechbrain>=1.0", "silero-vad>=5", "faster-whisper>=1.0"]
+s3 = ["boto3"]
+dev = ["pytest", "httpx"]
+
+[project.scripts]
+radiodb = "radiodb.cli:app"
+
+[tool.setuptools.packages.find]
+include = ["radiodb*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["models: needs the real speech models (slow, downloads weights)"]
+addopts = "-m 'not models'"
