@@ -65,21 +65,56 @@ def turns_from_windows(wins: list[Span], labels: np.ndarray) -> list[Turn]:
     return turns
 
 
+MIN_SPEAKER_FRACTION = 0.1
+
+
+def effective_min_speaker_s(wins: list[Span], min_speaker_s: float) -> float:
+    """The speech a voice needs to count as its own speaker: ``min_speaker_s`` (calibrated on
+    long meetings), but never more than 10 % of the recording's speech, so short calls keep
+    speakers who only talk for a few seconds."""
+    return min(min_speaker_s, MIN_SPEAKER_FRACTION * float(window_ownership(wins).sum()))
+
+
+def window_ownership(wins: list[Span]) -> np.ndarray:
+    """Seconds of audio each window owns: the same regions ``turns_from_windows`` assigns
+    (start to the next window's start), independent of labels."""
+    own = np.zeros(len(wins))
+    prev_end = -np.inf
+    for i, w in enumerate(wins):
+        start = max(w.start, prev_end)
+        end = wins[i + 1].start if i + 1 < len(wins) and wins[i + 1].start < w.end else w.end
+        if end > start:
+            own[i] = end - start
+            prev_end = end
+    return own
+
+
 def absorb_small_clusters(
     emb: np.ndarray, labels: np.ndarray, wins: list[Span], min_speaker_s: float
 ) -> np.ndarray:
-    """Merge clusters with under ``min_speaker_s`` of speech into the most similar large one."""
-    labels = labels.copy()
+    """Merge clusters with under ``min_speaker_s`` of speech into the most similar large one,
+    smallest first. Durations and centroid sums are updated incrementally, so this stays fast
+    for hour-long recordings with hundreds of initial clusters."""
+    ids, inv = np.unique(labels, return_inverse=True)
+    k = len(ids)
+    dur = np.bincount(inv, weights=window_ownership(wins), minlength=k)
+    sums = np.zeros((k, emb.shape[1]), dtype=np.float64)
+    np.add.at(sums, inv, emb)
+    target = np.arange(k)
+    alive = np.ones(k, dtype=bool)
     while True:
-        ids = np.unique(labels)
-        dur = {c: sum(t.end - t.start for t in turns_from_windows(wins, labels) if t.cluster == c) for c in ids}
-        big = [c for c in ids if dur[c] >= min_speaker_s]
-        small = [c for c in ids if dur[c] < min_speaker_s]
-        if not small or not big:
-            return labels
-        cent = {c: _normalise(emb[labels == c].mean(axis=0)) for c in ids}
-        c = min(small, key=lambda c: dur[c])
-        labels[labels == c] = max(big, key=lambda b: float(cent[b] @ cent[c]))
+        small = np.where(alive & (dur < min_speaker_s))[0]
+        big = np.where(alive & (dur >= min_speaker_s))[0]
+        if not len(small) or not len(big):
+            break
+        c = small[np.argmin(dur[small])]
+        cent = sums / np.maximum(np.linalg.norm(sums, axis=1, keepdims=True), 1e-12)
+        t = big[np.argmax(cent[big] @ cent[c])]
+        sums[t] += sums[c]
+        dur[t] += dur[c]
+        alive[c] = False
+        target[c] = t  # targets are always big clusters, which are never merged away
+    return ids[target[inv]]
 
 
 def diarize(
@@ -87,12 +122,26 @@ def diarize(
     min_speaker_s: float = 3.0,
 ) -> tuple[list[Turn], dict[int, np.ndarray]]:
     """Return speaker turns and one L2-normalised centroid per cluster."""
+    wins, emb = embed_windows(audio16k, vad, embedder)
+    return cluster_turns(wins, emb, threshold, min_speaker_s)
+
+
+def embed_windows(audio16k: np.ndarray, vad: VAD, embedder: SpeakerEmbedder) -> tuple[list[Span], np.ndarray]:
+    """VAD + sliding windows + speaker embeddings: the expensive half of diarization."""
     wins = windows(vad.speech(audio16k))
     if not wins:
-        return [], {}
+        return [], np.zeros((0, embedder.dim), dtype=np.float32)
     clips = [audio16k[int(w.start * MODEL_SR): int(w.end * MODEL_SR)] for w in wins]
-    emb = embedder.embed(clips)
-    labels = absorb_small_clusters(emb, cluster(emb, threshold), wins, min_speaker_s)
+    return wins, embedder.embed(clips)
+
+
+def cluster_turns(
+    wins: list[Span], emb: np.ndarray, threshold: float, min_speaker_s: float
+) -> tuple[list[Turn], dict[int, np.ndarray]]:
+    """The cheap half: cluster window embeddings into speakers and turns (re-runnable per setting)."""
+    if not wins:
+        return [], {}
+    labels = absorb_small_clusters(emb, cluster(emb, threshold), wins, effective_min_speaker_s(wins, min_speaker_s))
     centroids = {int(c): _normalise(emb[labels == c].mean(axis=0)) for c in np.unique(labels)}
     return turns_from_windows(wins, labels), centroids
 
@@ -102,18 +151,24 @@ def _overlap(a0: float, a1: float, b0: float, b1: float) -> float:
 
 
 def assign_words(words: list[Word], turns: list[Turn]) -> list[int | None]:
-    """Cluster label per word: the turn with most overlap, else the nearest turn."""
+    """Cluster label per word: the turn with most overlap. A word overlapping no turn (often a
+    zero-length ASR timestamp at a speaker change) stays with the previous word's speaker if it
+    follows closely, else goes to the nearest turn."""
     out: list[int | None] = []
+    prev_end = None
     for w in words:
         best, best_ov = None, 0.0
         for t in turns:
             ov = _overlap(w.start, w.end, t.start, t.end)
             if ov > best_ov:
                 best, best_ov = t.cluster, ov
+        if best is None and out and out[-1] is not None and prev_end is not None and w.start - prev_end <= 0.3:
+            best = out[-1]
         if best is None and turns:
             mid = (w.start + w.end) / 2
             best = min(turns, key=lambda t: min(abs(mid - t.start), abs(mid - t.end))).cluster
         out.append(best)
+        prev_end = w.end
     return out
 
 
