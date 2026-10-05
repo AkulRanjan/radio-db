@@ -31,6 +31,12 @@ def test_words_split_on_speaker_change_and_long_pause():
     assert [s["cluster"] for s in segs] == [0, 0, 1]
 
 
+def test_zero_length_word_at_boundary_stays_with_previous_speaker():
+    turns = [Turn(0, 2.0, 0), Turn(2.0, 4.0, 1)]
+    words = [Word("you", 1.5, 1.8), Word("know", 1.8, 2.0), Word("I", 2.0, 2.0), Word("heard", 2.1, 2.4)]
+    assert assign_words(words, turns) == [0, 0, 0, 1]
+
+
 def test_wordless_turns_are_kept():
     turns = [Turn(0, 2, 0), Turn(2.5, 5, 1)]
     words = [Word("hi", 0.2, 0.5)]
@@ -157,3 +163,12 @@ def test_reprocessing_and_deleting_do_not_leave_orphan_speakers(db, asr):
     db.enroll("u1", "Alice", [wav_bytes(conversation([("A", 5.0)]))])
     db.delete_recording("u1", rec["id"])
     assert [s["name"] for s in db.list_speakers("u1")] == ["Alice"]  # named profiles are kept
+
+
+def test_min_speaker_scales_down_for_short_recordings():
+    from radiodb.pipeline.diarize import effective_min_speaker_s
+
+    short = windows([Span(0, 22.0)])     # ~22 s of speech: a brief phone call
+    long_ = windows([Span(0, 1800.0)])   # 30 min meeting
+    assert effective_min_speaker_s(short, 20.0) == pytest.approx(2.2, abs=0.05)
+    assert effective_min_speaker_s(long_, 20.0) == 20.0
