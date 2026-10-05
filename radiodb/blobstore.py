@@ -23,6 +23,7 @@ class BlobStore(Protocol):
     def get(self, key: str) -> bytes: ...
     def delete(self, key: str) -> None: ...
     def exists(self, key: str) -> bool: ...
+    def ping(self) -> None: ...
 
 
 class LocalBlobStore:
@@ -54,6 +55,11 @@ class LocalBlobStore:
     def exists(self, key: str) -> bool:
         return self._path(key).exists()
 
+    def ping(self) -> None:
+        probe = self.root / ".health"
+        probe.write_bytes(b"ok")
+        probe.unlink()
+
 
 class S3BlobStore:
     def __init__(self, bucket: str, prefix: str = "", endpoint_url: str | None = None):
@@ -66,6 +72,8 @@ class S3BlobStore:
         self.s3 = boto3.client("s3", endpoint_url=endpoint_url)
 
     def put(self, key: str, data: bytes) -> None:
+        if self.exists(key):  # content-addressed: same key means same bytes, skip the upload
+            return
         self.s3.put_object(
             Bucket=self.bucket, Key=self.prefix + key, Body=data, ServerSideEncryption="AES256"
         )
@@ -86,6 +94,9 @@ class S3BlobStore:
             if e.response["Error"]["Code"] in ("404", "NoSuchKey"):
                 return False
             raise
+
+    def ping(self) -> None:
+        self.s3.head_bucket(Bucket=self.bucket)
 
 
 def make_blob_store(settings: Settings) -> BlobStore:
