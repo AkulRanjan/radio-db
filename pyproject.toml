@@ -17,14 +17,19 @@ dependencies = [
     "uvicorn[standard]",
     "python-multipart",
     "typer",
+    "pyjwt[crypto]>=2.8",
 ]
 
 [project.optional-dependencies]
 # PyTorch: install the CUDA build first if you have an NVIDIA GPU, e.g.
 #   pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu126
-ml = ["torch", "torchaudio", "speechbrain>=1.0", "silero-vad>=5", "faster-whisper>=1.0"]
+ml = [
+    "torch", "torchaudio", "speechbrain>=1.0", "silero-vad>=5", "faster-whisper>=1.0",
+    "praat-parselmouth>=0.4", "sentence-transformers>=3",
+]
 s3 = ["boto3"]
-dev = ["pytest", "httpx"]
+postgres = ["psycopg[binary]>=3.2", "psycopg-pool>=3.2"]
+dev = ["pytest", "httpx", "boto3", "moto[server]>=5"]
 
 [project.scripts]
 radiodb = "radiodb.cli:app"
