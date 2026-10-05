@@ -1,0 +1,31 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: radiodb
+          POSTGRES_PASSWORD: radiodb
+          POSTGRES_DB: radiodb
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U radiodb" --health-interval 5s --health-retries 10
+    env:
+      RADIODB_TEST_DATABASE_URL: postgresql://radiodb:radiodb@localhost:5432/radiodb
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      # CPU torch keeps CI small; the fast suite uses fake models, so no weights are downloaded.
+      - run: pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+      - run: pip install -e ".[ml,postgres,s3,dev]"
+      - run: pytest -q   # SQLite + Postgres + S3 (moto); real-model tests are opt-in: pytest -m models
