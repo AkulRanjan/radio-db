@@ -1,0 +1,65 @@
+# Local services.
+#
+#   docker compose up -d postgres            # just the database (for running radiodb from the venv)
+#   docker compose --profile app up -d       # full stack: postgres + API + worker, built from the Dockerfile
+#
+# From the venv against this Postgres:
+#   set RADIODB_DATABASE_URL=postgresql://radiodb:radiodb@127.0.0.1:55432/radiodb
+#   set RADIODB_TEST_DATABASE_URL=%RADIODB_DATABASE_URL%   (to run the test suite on Postgres too)
+# Port 55432 avoids clashing with any other Postgres on 5432.
+#
+# The API and worker share the /data volume for audio blobs and model weights. In production
+# use S3 (RADIODB_BLOB_BACKEND=s3, ...) and RADIODB_AUTH=jwt instead.
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: radiodb-postgres
+    environment:
+      POSTGRES_USER: radiodb
+      POSTGRES_PASSWORD: radiodb
+      POSTGRES_DB: radiodb
+    ports:
+      - "127.0.0.1:55432:5432"
+    volumes:
+      - radiodb-pg:/var/lib/postgresql/data
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "radiodb"]
+      interval: 5s
+      retries: 10
+
+  api:
+    profiles: ["app"]
+    build: .
+    image: radiodb:latest
+    environment: &app-env
+      RADIODB_DATABASE_URL: postgresql://radiodb:radiodb@postgres:5432/radiodb
+      RADIODB_AUTH: ${RADIODB_AUTH:-header}
+      RADIODB_JWT_SECRET: ${RADIODB_JWT_SECRET:-}
+      RADIODB_JWT_JWKS_URL: ${RADIODB_JWT_JWKS_URL:-}
+      RADIODB_DEVICE: ${RADIODB_DEVICE:-cpu}
+    ports:
+      - "127.0.0.1:${RADIODB_API_PORT:-8000}:8000"
+    volumes:
+      - radiodb-data:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  worker:
+    profiles: ["app"]
+    image: radiodb:latest
+    command: ["radiodb", "worker"]
+    environment: *app-env
+    healthcheck:
+      disable: true   # the image's healthcheck probes the API port, which workers don't serve
+    volumes:
+      - radiodb-data:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+    stop_grace_period: 2m   # let a running job finish its current step
+
+volumes:
+  radiodb-pg:
+  radiodb-data:
